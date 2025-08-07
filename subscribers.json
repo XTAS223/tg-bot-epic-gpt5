@@ -1,0 +1,19 @@
+{
+  "chat_ids": [
+    5199158899
+  ],
+  "offer_subs": {
+    "5199158899": {
+      "9aa227e2ba294bb1a95c95fde892eb31": {
+        "title": "Totally Reliable Delivery Service Standard Edition",
+        "pageSlug": "totally-reliable-delivery-service",
+        "notified": false
+      },
+      "8ea3500dc38e4f429702bf889c172d3d": {
+        "title": "Hidden Folks",
+        "pageSlug": "hidden-folks-239d16",
+        "notified": false
+      }
+    }
+  }
+}
