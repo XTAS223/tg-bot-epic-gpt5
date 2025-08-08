@@ -119,7 +119,10 @@ def _get_keepalive_url() -> Optional[str]:
     # Preferred explicit env
     url = _os.getenv("KEEPALIVE_URL")
     if url:
-        return url
+        # Ensure scheme
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = f"https://{url}"
+        return url.rstrip("/") + "/"
     # Common platform envs
     for key in [
         "KOYEB_PRETTY_URL",
@@ -135,9 +138,10 @@ def _get_keepalive_url() -> Optional[str]:
             # Add scheme if needed
             if not v.startswith("http://") and not v.startswith("https://"):
                 v = f"https://{v}"
-            return v.rstrip("/") + "/health"
+            # Simulate opening the root page
+            return v.rstrip("/") + "/"
     # Fallback to local health which won't prevent deep sleep but keeps code robust
-    return "http://localhost:8000/health"
+    return "http://localhost:8000/"
 
 
 async def _keepalive_once(url: str) -> None:
