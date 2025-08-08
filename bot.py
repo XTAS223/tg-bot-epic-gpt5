@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 import threading
-from datetime import datetime, timezone, time
+from datetime import datetime, timezone, time, timedelta
 import math
 from typing import Any, Dict, List, Optional, Tuple
 import re
@@ -10,6 +10,7 @@ from urllib.parse import quote_plus
 
 import aiohttp
 from aiohttp import web
+import os as _os
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -17,6 +18,8 @@ from telegram import (
     InputMediaVideo,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -31,7 +34,28 @@ SUBSCRIBERS_FILE = "subscribers.json"
 
 # Simple in-memory cache: { (locale, country, kind): {"at": datetime, "items": list} }
 FREE_GAMES_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL_SECONDS = 600
+TRAILER_CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL_SECONDS = 600  # legacy TTL fallback
+# Menu button labels (with emojis for better visuals)
+MENU_BTN_FREE = "🎁 Free Games"
+MENU_BTN_UPCOMING = "⏳ Upcoming"
+MENU_BTN_SUB = "🔔 Subscribe Daily"
+MENU_BTN_UNSUB = "🔕 Unsubscribe Daily"
+
+
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    # Two row layout with larger hit targets on iOS
+    keyboard_rows = [
+        [KeyboardButton(MENU_BTN_FREE), KeyboardButton(MENU_BTN_UPCOMING)],
+        [KeyboardButton(MENU_BTN_SUB), KeyboardButton(MENU_BTN_UNSUB)],
+    ]
+    return ReplyKeyboardMarkup(keyboard_rows, resize_keyboard=True, one_time_keyboard=False, input_field_placeholder="Select an action…")
+
+
+def next_midnight_utc(now: Optional[datetime] = None) -> datetime:
+    now = now or datetime.now(timezone.utc)
+    next_day = (now + timedelta(days=1)).date()
+    return datetime.combine(next_day, time.min, tzinfo=timezone.utc)
 
 
 def load_json(path: str, default: Any) -> Any:
@@ -91,6 +115,58 @@ def start_health_server_in_background() -> None:
     thread.start()
 
 
+def _get_keepalive_url() -> Optional[str]:
+    # Preferred explicit env
+    url = _os.getenv("KEEPALIVE_URL")
+    if url:
+        return url
+    # Common platform envs
+    for key in [
+        "KOYEB_PRETTY_URL",
+        "RENDER_EXTERNAL_URL",
+        "VERCEL_URL",
+        "RAILWAY_PUBLIC_DOMAIN",
+        "FLY_APP_URL",
+        "PUBLIC_BASE_URL",
+        "BASE_URL",
+    ]:
+        v = _os.getenv(key)
+        if v:
+            # Add scheme if needed
+            if not v.startswith("http://") and not v.startswith("https://"):
+                v = f"https://{v}"
+            return v.rstrip("/") + "/health"
+    # Fallback to local health which won't prevent deep sleep but keeps code robust
+    return "http://localhost:8000/health"
+
+
+async def _keepalive_once(url: str) -> None:
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                await resp.read()
+    except Exception:
+        # Silently ignore to avoid log noise
+        pass
+
+
+async def keepalive_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = _get_keepalive_url()
+    await _keepalive_once(url)
+
+
+def start_keepalive_thread(interval_seconds: int = 200) -> None:
+    async def _runner() -> None:
+        url = _get_keepalive_url()
+        while True:
+            await _keepalive_once(url)
+            await asyncio.sleep(interval_seconds)
+
+    thread = threading.Thread(target=lambda: asyncio.run(_runner()), daemon=True)
+    thread.start()
+
+
 def _cache_key(locale: str, country: str, kind: str) -> str:
     return f"{locale}|{country}|{kind}"
 
@@ -100,15 +176,27 @@ def _get_cached(locale: str, country: str, kind: str) -> Optional[List[Dict[str,
     entry = FREE_GAMES_CACHE.get(key)
     if not entry:
         return None
-    if (datetime.now(timezone.utc) - entry["at"]).total_seconds() > CACHE_TTL_SECONDS:
-        FREE_GAMES_CACHE.pop(key, None)
-        return None
+    now = datetime.now(timezone.utc)
+    expires: Optional[datetime] = entry.get("expires")
+    if expires is not None:
+        if now >= expires:
+            FREE_GAMES_CACHE.pop(key, None)
+            return None
+    else:
+        # Legacy at-based TTL
+        if (now - entry["at"]).total_seconds() > CACHE_TTL_SECONDS:
+            FREE_GAMES_CACHE.pop(key, None)
+            return None
     return entry["items"]
 
 
 def _set_cached(locale: str, country: str, kind: str, items: List[Dict[str, Any]]) -> None:
     key = _cache_key(locale, country, kind)
-    FREE_GAMES_CACHE[key] = {"at": datetime.now(timezone.utc), "items": items}
+    FREE_GAMES_CACHE[key] = {
+        "at": datetime.now(timezone.utc),
+        "expires": next_midnight_utc(),  # cache until next UTC midnight
+        "items": items,
+    }
 
 
 async def fetch_free_games(locale: str = "en-US", country: str = "US") -> List[Dict[str, Any]]:
@@ -359,7 +447,10 @@ async def send_free_games(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> N
         title = el.get("title", "Free Game")
         url = build_store_url(el)
         image_url = pick_image_url(el)
-        caption = f"<b>{title}</b>\n<a href=\"{url}\">Claim on Epic Games Store</a>"
+        # Compact caption (title only) for better iOS rendering
+        caption = f"<b>{title}</b>"
+        # Inline "Open" button for each free game
+        open_kbd = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Open", url=url)]])
 
         # Try to fetch a trailer video using the product page slug
         page_slug = get_page_slug(el)
@@ -371,20 +462,7 @@ async def send_free_games(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> N
             except Exception:
                 trailer_video_url = None
 
-        # Prefer sending photo + trailer as a media group if both exist
-        if image_url and trailer_video_url:
-            media = [
-                InputMediaPhoto(media=image_url, caption=caption, parse_mode=ParseMode.HTML),
-                InputMediaVideo(media=trailer_video_url),
-            ]
-            try:
-                await context.bot.send_media_group(chat_id=chat_id, media=media)
-                continue
-            except Exception:
-                # Fallback to separate sends
-                pass
-
-        # If media group not possible, send photo (with caption) then trailer (if any)
+        # Send photo first with compact caption, then trailer (if any)
         if image_url:
             try:
                 await context.bot.send_photo(
@@ -392,6 +470,7 @@ async def send_free_games(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> N
                     photo=image_url,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
+                    reply_markup=open_kbd,
                 )
             except Exception:
                 await context.bot.send_message(
@@ -399,6 +478,7 @@ async def send_free_games(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> N
                     text=caption,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=False,
+                    reply_markup=open_kbd,
                 )
         else:
             await context.bot.send_message(
@@ -406,6 +486,7 @@ async def send_free_games(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> N
                 text=caption,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=False,
+                reply_markup=open_kbd,
             )
 
         if trailer_video_url:
@@ -448,6 +529,13 @@ def get_page_slug(el: Dict[str, Any]) -> Optional[str]:
 
 
 async def fetch_trailer_urls(page_slug: str, locale: str = "en-US", namespace: str = "") -> Tuple[Optional[str], Optional[str]]:
+    # trailer cache key: namespace|page_slug|locale fallback-independent
+    cache_key = f"{namespace}|{page_slug}|{locale}"
+    cached = TRAILER_CACHE.get(cache_key)
+    now = datetime.now(timezone.utc)
+    if cached and now < cached.get("expires", now - timedelta(seconds=1)):
+        return cached.get("direct"), cached.get("youtube")
+
     locales_to_try = [locale, "en", "en-GB"]
     slug_candidates = [page_slug]
     stripped = re.sub(r"-[0-9a-f]{6}$", "", page_slug, flags=re.IGNORECASE)
@@ -479,6 +567,12 @@ async def fetch_trailer_urls(page_slug: str, locale: str = "en-US", namespace: s
             if data is not None:
                 break
         if data is None:
+            # cache negative result for 6 hours to reduce repeated 404s
+            TRAILER_CACHE[cache_key] = {
+                "direct": None,
+                "youtube": None,
+                "expires": now + timedelta(hours=6),
+            }
             return None, None
 
     # Prefer structured location: pages -> productHome -> modules
@@ -562,10 +656,20 @@ async def fetch_trailer_urls(page_slug: str, locale: str = "en-US", namespace: s
         youtube_link = youtube_link or y
 
     if not direct_video and not youtube_link:
-        print(f"No trailer found for slug '{page_slug}' from content API")
-    else:
-        print(f"Trailer for '{page_slug}': direct={bool(direct_video)} youtube={youtube_link}")
+        # store negative for 6 hours
+        TRAILER_CACHE[cache_key] = {
+            "direct": None,
+            "youtube": None,
+            "expires": now + timedelta(hours=6),
+        }
+        return None, None
 
+    # store positive for 24 hours
+    TRAILER_CACHE[cache_key] = {
+        "direct": direct_video,
+        "youtube": youtube_link,
+        "expires": now + timedelta(hours=24),
+    }
     return direct_video, youtube_link
 
 
@@ -587,20 +691,7 @@ async def search_youtube_trailer(query: str) -> Optional[str]:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Show Free Games", callback_data="action:free")],
-        [InlineKeyboardButton("Show Upcoming", callback_data="action:upcoming")],
-        [
-            InlineKeyboardButton("Subscribe", callback_data="sub:1"),
-            InlineKeyboardButton("Unsubscribe", callback_data="sub:0"),
-        ],
-    ])
-    await update.message.reply_text(
-        "Hi! Use /freegames to see this week's free Epic Games.\n"
-        "Use /subscribe to get a daily reminder while the bot is running.\n"
-        "You can also /setlocale and /setcountry.",
-        reply_markup=keyboard,
-    )
+    await update.message.reply_text("Hi! Use the quick menu below.", reply_markup=get_main_keyboard())
 
 
 async def freegames_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -624,24 +715,38 @@ async def upcoming_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if start_iso:
             try:
                 start_dt = datetime.fromisoformat(start_iso)
-                # Compute days delta in whole days (ceil if partial day)
-                delta_days = math.ceil((start_dt - now).total_seconds() / 86400)
-                # Format as: in 3 days (08.14)
-                when = f"in {delta_days} day{'s' if delta_days != 1 else ''} ({start_dt.strftime('%m.%d')})"
+                total_seconds = max(0, int((start_dt - now).total_seconds()))
+                if total_seconds < 3600:
+                    mins = max(1, total_seconds // 60)
+                    when = f"in {mins:02d} min"
+                else:
+                    days = total_seconds // 86400
+                    hours = (total_seconds % 86400) // 3600
+                    if days > 0:
+                        when = f"in {days} day{'s' if days != 1 else ''} and {hours} hour{'s' if hours != 1 else ''}"
+                    else:
+                        when = f"in {hours} hour{'s' if hours != 1 else ''}"
             except Exception:
                 pass
-        caption = f"<b>{title}</b>\n{when}\n<a href=\"{url}\">View on Epic</a>"
-        # Show per-game notify toggle: Subscribe if not subscribed, Unsubscribe if subscribed
+        # Cleaner, compact caption for iOS
+        caption = f"<b>{title}</b>\n{when}"
+        # Show per-game notify toggle + compact Open button in one row
         offer_id = get_offer_id(el)
         keyboard = None
         if offer_id:
             if is_subscribed_to_offer(chat_id, offer_id):
                 keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Unnotify This Game", callback_data=f"offer_unsub:{offer_id}")]
+                    [
+                        InlineKeyboardButton("🛒 Open", url=url),
+                        InlineKeyboardButton("🔕 Unnotify", callback_data=f"offer_unsub:{offer_id}"),
+                    ]
                 ])
             else:
                 keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Notify When Free", callback_data=f"offer_sub:{offer_id}")]
+                    [
+                        InlineKeyboardButton("🛒 Open", url=url),
+                        InlineKeyboardButton("🔔 Notify", callback_data=f"offer_sub:{offer_id}"),
+                    ]
                 ])
         if image_url:
             try:
@@ -730,6 +835,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await q.message.reply_text("You were not subscribed.")
     elif data == "action:free":
         await send_free_games(q.message.chat.id, context)
+        try:
+            await q.message.reply_text("Choose an option:", reply_markup=get_main_keyboard())
+        except Exception:
+            pass
     elif data == "action:upcoming":
         # simulate a command
         class Dummy:
@@ -830,6 +939,8 @@ def main() -> None:
 
     # Start lightweight HTTP server for Koyeb health checks
     start_health_server_in_background()
+    # Start background keepalive pings every ~200s to prevent deep sleep
+    start_keepalive_thread(interval_seconds=200)
 
     app = Application.builder().token(token).build()
 
@@ -844,15 +955,39 @@ def main() -> None:
     from telegram.ext import CallbackQueryHandler
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Fallback: reply to any text with a hint
+    # Fallback: do nothing (suppress hint messages)
     async def _fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.message.reply_text("Try /freegames, /subscribe or /unsubscribe")
+        return
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _fallback))
+    # Fallback handler (runs after menu router)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _fallback), group=1)
+    # Reply keyboard shortcuts
+    async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        raw = (update.message.text or "").strip()
+        txt = raw.lower()
+        if raw == MENU_BTN_FREE or "free games" in txt:
+            await freegames_cmd(update, context)
+            return
+        if raw == MENU_BTN_UPCOMING or txt == "upcoming":
+            await upcoming_cmd(update, context)
+            return
+        if raw == MENU_BTN_SUB or txt == "subscribe daily":
+            await subscribe_cmd(update, context)
+            return
+        if raw == MENU_BTN_UNSUB or txt == "unsubscribe daily":
+            await unsubscribe_cmd(update, context)
+            return
+        # Otherwise ignore silently
+        return
+
+    # Menu router handler (runs before fallback)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_menu), group=0)
 
     # Schedule a daily job at 10:00 UTC (if JobQueue is available)
     if app.job_queue is not None:
         app.job_queue.run_daily(daily_job, time=time(hour=10, minute=0, tzinfo=timezone.utc))
+        # Also schedule a keepalive with JobQueue (redundant with thread, but survives some envs)
+        app.job_queue.run_repeating(lambda c: keepalive_job(c), interval=200, first=10)
     else:
         print("Warning: JobQueue is not available. Daily reminders are disabled.\n"
               "Install with: pip install \"python-telegram-bot[job-queue]\"")
