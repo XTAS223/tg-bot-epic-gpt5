@@ -1,5 +1,7 @@
 import os
 import json
+import asyncio
+import threading
 from datetime import datetime, timezone, time
 import math
 from typing import Any, Dict, List, Optional, Tuple
@@ -7,6 +9,7 @@ import re
 from urllib.parse import quote_plus
 
 import aiohttp
+from aiohttp import web
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -49,6 +52,43 @@ def save_json(path: str, data: Any) -> None:
 def ensure_files_exist() -> None:
     if not os.path.exists(SUBSCRIBERS_FILE):
         save_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}})
+
+
+# --- Minimal HTTP server for Koyeb health checks ---
+def _create_health_app() -> web.Application:
+    app = web.Application()
+
+    async def root_handler(request: web.Request) -> web.Response:
+        return web.Response(text="OK", content_type="text/plain")
+
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.json_response({
+            "status": "ok",
+            "time": datetime.now(timezone.utc).isoformat(),
+        })
+
+    app.router.add_get("/", root_handler)
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/healthz", health_handler)
+    return app
+
+
+async def _run_http_server_forever() -> None:
+    port = int(os.getenv("PORT", "8000"))
+    app = _create_health_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health server listening on 0.0.0.0:{port}")
+    # Keep running forever
+    while True:
+        await asyncio.sleep(3600)
+
+
+def start_health_server_in_background() -> None:
+    thread = threading.Thread(target=lambda: asyncio.run(_run_http_server_forever()), daemon=True)
+    thread.start()
 
 
 def _cache_key(locale: str, country: str, kind: str) -> str:
@@ -787,6 +827,9 @@ def main() -> None:
         return
 
     ensure_files_exist()
+
+    # Start lightweight HTTP server for Koyeb health checks
+    start_health_server_in_background()
 
     app = Application.builder().token(token).build()
 
