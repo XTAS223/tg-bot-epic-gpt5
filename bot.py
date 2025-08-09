@@ -75,7 +75,7 @@ def save_json(path: str, data: Any) -> None:
 
 def ensure_files_exist() -> None:
     if not os.path.exists(SUBSCRIBERS_FILE):
-        save_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}})
+        save_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}, "digest": {}})
 
 
 # --- Minimal HTTP server for Koyeb health checks ---
@@ -362,7 +362,7 @@ def build_store_url(el: Dict[str, Any], locale: str = "en-US") -> str:
 
 def get_user_prefs(chat_id: int) -> Dict[str, str]:
     ensure_files_exist()
-    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}})
+    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}, "digest": {}})
     users = data.get("users", {})
     prefs = users.get(str(chat_id)) or {}
     return {
@@ -373,7 +373,7 @@ def get_user_prefs(chat_id: int) -> Dict[str, str]:
 
 def set_user_pref(chat_id: int, key: str, value: str) -> None:
     ensure_files_exist()
-    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}})
+    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}, "digest": {}})
     users = data.setdefault("users", {})
     user = users.setdefault(str(chat_id), {})
     user[key] = value
@@ -394,14 +394,14 @@ def get_offer_id(el: Dict[str, Any]) -> Optional[str]:
 
 def is_subscribed_to_offer(chat_id: int, offer_id: str) -> bool:
     ensure_files_exist()
-    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}})
+    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}, "digest": {}})
     subs = data.get("offer_subs", {}).get(str(chat_id), {})
     return offer_id in subs
 
 
 def subscribe_to_offer(chat_id: int, offer_id: str, title: str, page_slug: Optional[str]) -> None:
     ensure_files_exist()
-    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}})
+    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}, "digest": {}})
     user_subs = data.setdefault("offer_subs", {}).setdefault(str(chat_id), {})
     user_subs[offer_id] = {
         "title": title,
@@ -413,7 +413,7 @@ def subscribe_to_offer(chat_id: int, offer_id: str, title: str, page_slug: Optio
 
 def unsubscribe_from_offer(chat_id: int, offer_id: str) -> None:
     ensure_files_exist()
-    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}})
+    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}, "digest": {}})
     user_subs = data.setdefault("offer_subs", {}).setdefault(str(chat_id), {})
     if offer_id in user_subs:
         user_subs.pop(offer_id, None)
@@ -422,7 +422,7 @@ def unsubscribe_from_offer(chat_id: int, offer_id: str) -> None:
 
 async def send_subscriptions_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     ensure_files_exist()
-    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}})
+    data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}, "digest": {}})
     user_subs: Dict[str, Dict[str, Any]] = data.get("offer_subs", {}).get(str(chat_id), {})
     if not user_subs:
         await context.bot.send_message(chat_id=chat_id, text="You have no game notifications set.")
@@ -879,54 +879,60 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     ensure_files_exist()
-    store = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}})
+    store = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}, "digest": {}})
     subs = store.get("chat_ids", [])
-    offer_subs: Dict[str, Dict[str, Any]] = load_json(SUBSCRIBERS_FILE, {"offer_subs": {}}).get("offer_subs", {})
-    if not subs:
-        subs = []
-    # Build a union of chats to process: regular daily + those who have per-offer subs
+    offer_subs: Dict[str, Dict[str, Any]] = store.get("offer_subs", {})
+    digest_state: Dict[str, Any] = store.get("digest", {})
+
+    # Only notify when new free games become available (change detection)
+    # Build a union of chats to process: those with daily subs or per-offer subs
     chat_ids_to_process = set(map(int, subs)) | set(map(int, offer_subs.keys()))
 
-    # For each chat, check per-offer subscriptions: if an upcoming subscribed game is now free, notify once
     for chat_id in chat_ids_to_process:
         prefs = get_user_prefs(chat_id)
         try:
             current = await fetch_free_games(locale=prefs["locale"], country=prefs["country"])
         except Exception:
             current = []
-        # Map current free offers by id
-        free_ids = set()
-        for el in current:
-            oid = get_offer_id(el)
-            if oid:
-                free_ids.add(oid)
 
-        # Notify for offers that became free
+        # Hash current free offers list for change detection
+        current_ids = [get_offer_id(el) or el.get("title") for el in current]
+        current_ids = [cid for cid in current_ids if cid]
+        key = f"{chat_id}|{prefs['locale']}|{prefs['country']}"
+        last_ids = digest_state.get(key, [])
+
+        # Per-offer notifications: if a subscribed upcoming game is now free
         user_offer_subs = offer_subs.get(str(chat_id), {})
-        any_sent = False
+        free_set = set(current_ids)
+        any_change = False
+        # Detect new free offers since last check
+        new_free = [cid for cid in current_ids if cid not in set(last_ids)]
+        if new_free:
+            any_change = True
+        # Send per-offer notifications
         for oid, meta in user_offer_subs.items():
-            if free_ids and oid in free_ids and not meta.get("notified"):
+            if oid in free_set and not meta.get("notified"):
                 title = meta.get("title") or oid
                 url = f"https://store.epicgames.com/en-US/p/{meta.get('pageSlug')}" if meta.get("pageSlug") else "https://store.epicgames.com/"
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=f"Now free: {title}\n{url}")
                     meta["notified"] = True
-                    any_sent = True
+                    any_change = True
                 except Exception:
                     pass
-        if any_sent:
-            # Persist notifications state
-            data = load_json(SUBSCRIBERS_FILE, {"chat_ids": [], "users": {}, "offer_subs": {}})
-            data["offer_subs"][str(chat_id)] = user_offer_subs
-            save_json(SUBSCRIBERS_FILE, data)
 
-    # Keep existing daily digest for regular subscribers
-    for chat_id in subs:
-        try:
-            await send_free_games(chat_id, context)
-        except Exception:
-            # Ignore errors to continue sending to others
-            pass
+        # If there is a change in free games, send the digest once using the existing renderer
+        if any_change and subs and chat_id in subs:
+            try:
+                await send_free_games(chat_id, context)
+            except Exception:
+                pass
+
+        # Persist digest state and per-offer notifications
+        digest_state[key] = current_ids
+        store["digest"] = digest_state
+        store["offer_subs"][str(chat_id)] = user_offer_subs
+        save_json(SUBSCRIBERS_FILE, store)
 
 
 def main() -> None:
